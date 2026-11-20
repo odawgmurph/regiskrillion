@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import { mkdir,writeFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 const base=process.argv[2]||'http://localhost:3051',out=process.argv[3]||'output/mobile-flow',local=base.includes('localhost');await mkdir(out,{recursive:true});
-const browser=await chromium.launch({headless:true,channel:'chrome'}),context=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true}),page=await context.newPage(),errors=[];
+const browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_PATH?{executablePath:process.env.CHROMIUM_PATH}:{channel:'chrome'})}),context=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true}),page=await context.newPage(),errors=[];
 page.on('pageerror',e=>errors.push(e.message));
 try{
  await page.goto(base+'/?test=1');await page.waitForFunction(()=>window.render_game_to_text);await page.locator('#practice-btn').click();

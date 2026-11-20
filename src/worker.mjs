@@ -1,12 +1,14 @@
 import { SITE } from './config.mjs';
 import { documents } from './docs.mjs';
-import { homePage, infoPage } from './html.mjs';
+import { homePage, infoPage, createPage } from './html.mjs';
 import { DEMO } from './demo.mjs';
-import { TIERS, normalize, matchAnswer, etDate, resetAt, ROUND_MS, PREVIEW_MS } from '../public/rules.mjs';
+import { TIERS, matchAnswer, etDate, resetAt, ROUND_MS, PREVIEW_MS } from '../public/rules.mjs';
+import { buildCustomGame, LIMITS } from '../public/custom.mjs';
 
 const cache = new Map();
 const json = (data, status = 200, extra = {}) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', ...extra } });
 const fail = (message, status = 400) => json({ error: message }, status);
+const playerCookie = (id, url) => `ok_player=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${url.protocol === 'https:' ? '; Secure' : ''}`;
 const playerId = request => request.headers.get('Cookie')?.match(/(?:^|;\s*)ok_player=([a-f0-9-]{36})/)?.[1];
 function headers(response, additional = {}) {
   const h = new Headers(response.headers);
@@ -42,24 +44,42 @@ async function puzzleFor(env, date) {
   }
   return { ...DEMO, date, dayNumber: Math.floor((Date.parse(date) - Date.parse('2026-07-16')) / 86400000) + 1, sample: true };
 }
+const customId = id => typeof id === 'string' && /^[a-z0-9]{10}$/.test(id) ? id : null;
+async function customGame(env, id) {
+  if (!customId(id)) return null;
+  const key = 'custom:' + id;
+  if (cache.has(key)) return cache.get(key);
+  const row = await env.DB.prepare('SELECT id,title,content,created_at FROM custom_games WHERE id=?').bind(id).first();
+  if (!row) return null;
+  const game = { ...JSON.parse(row.content), id: row.id, title: row.title, createdAt: row.created_at };
+  cache.set(key, game);
+  return game;
+}
+async function puzzleForRun(env, run) {
+  if (!run.game_id) return puzzleFor(env, run.date);
+  const game = await customGame(env, run.game_id);
+  if (!game) throw new Error('Custom game missing');
+  return { date: run.date, dayNumber: 0, source: 'Custom game', title: game.title, customId: game.id, prompts: game.prompts };
+}
 async function saveSample(env, puzzle) {
   if (puzzle.sample) await env.DB.prepare('INSERT OR IGNORE INTO puzzles(date,day_number,source,content) VALUES(?,?,?,?)').bind(puzzle.date, puzzle.dayNumber, puzzle.source, JSON.stringify(puzzle)).run();
 }
 function promptDTO(puzzle) {
-  return { date: puzzle.date, dayNumber: puzzle.dayNumber, sample: !!puzzle.sample, source: puzzle.source, resetsAt: resetAt(puzzle.date), prompts: puzzle.prompts.map(({ id, text }) => ({ id, text })) };
+  return { date: puzzle.date, dayNumber: puzzle.dayNumber, sample: !!puzzle.sample, source: puzzle.source, resetsAt: resetAt(puzzle.date), ...(puzzle.customId ? { customId: puzzle.customId, title: puzzle.title } : {}), prompts: puzzle.prompts.map(({ id, text }) => ({ id, text })) };
 }
 async function state(env, run) {
   const results = (await env.DB.prepare('SELECT round,raw_answer AS rawAnswer,answer,tier,score FROM answers WHERE run_id=? ORDER BY round').bind(run.id).all()).results;
-  const puzzle = await puzzleFor(env, run.date);
-  return { ...promptDTO(puzzle), runId: run.id, mode: run.mode, round: run.next_round, roundStart: run.round_start, pausedAt: run.paused_at || null, serverNow: Date.now(), completed: !!run.completed, results, score: results.reduce((s, r) => s + r.score, 0) };
+  const puzzle = await puzzleForRun(env, run);
+  return { ...promptDTO(puzzle), runId: run.id, mode: run.game_id ? 'custom' : run.mode, round: run.next_round, roundStart: run.round_start, pausedAt: run.paused_at || null, serverNow: Date.now(), completed: !!run.completed, results, score: results.reduce((s, r) => s + r.score, 0) };
 }
 async function ownRun(env, id, player) {
   if (!/^[a-f0-9-]{36}$/.test(id || '')) return null;
   return env.DB.prepare('SELECT * FROM runs WHERE id=? AND player=?').bind(id, player || '').first();
 }
+const clientIp = request => request.headers.get('CF-Connecting-IP') || request.headers.get('X-Real-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'local';
 async function limit(env, request, player) {
   const window = Math.floor(Date.now() / 60000);
-  const raw = `${player || ''}|${request.headers.get('CF-Connecting-IP') || 'local'}|${window}`;
+  const raw = `${player || ''}|${clientIp(request)}|${window}`;
   const key = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw)))].map(x => x.toString(16).padStart(2, '0')).join('');
   const count = await env.DB.prepare('INSERT INTO rate_limits(key,window,count) VALUES(?,?,1) ON CONFLICT(key,window) DO UPDATE SET count=count+1 RETURNING count').bind(key, window).first();
   if (count.count === 1) await env.DB.prepare('DELETE FROM rate_limits WHERE window<?').bind(window - 5).run();
@@ -69,6 +89,17 @@ async function api(request, env, url) {
   const date = etDate(), path = url.pathname, player = playerId(request);
   if (request.method === 'GET' && path === '/api/today') return json(promptDTO(await puzzleFor(env, date)));
   if (request.method === 'GET' && path === '/api/health') return json({ ok: true, name: SITE.name, database: !!(await env.DB.prepare('SELECT 1 AS ok').first()), storage: !!env.BUCKET });
+  if (request.method === 'GET' && path === '/api/custom') {
+    const game = await customGame(env, url.searchParams.get('id'));
+    if (!game) return fail('That custom dive does not exist.', 404);
+    return json({ id: game.id, title: game.title, rounds: game.prompts.length, prompts: game.prompts.map(({ id, text }) => ({ id, text })) });
+  }
+  if (request.method === 'GET' && path === '/api/cron/sync') {
+    // Vercel Cron sends Authorization: Bearer $CRON_SECRET when that variable is set.
+    if (!env.CRON_SECRET || request.headers.get('Authorization') !== `Bearer ${env.CRON_SECRET}`) return fail('Not found.', 404);
+    if (env.REFERENCE_SYNC !== 'true') return json({ skipped: true });
+    const p = await syncPuzzle(env, date); return json({ date: p.date, rounds: p.prompts.length });
+  }
   if (request.method === 'GET' && path === '/api/state') {
     const run = await ownRun(env, url.searchParams.get('run'), player);
     return run ? json(await state(env, run)) : fail('Dive not found on this browser.', 404);
@@ -76,8 +107,8 @@ async function api(request, env, url) {
   if (request.method === 'GET' && path === '/api/review') {
     const run = await ownRun(env, url.searchParams.get('run'), player);
     if (!run?.completed) return fail('Finish your dive before opening the answer sheet.', 403);
-    const puzzle = await puzzleFor(env, run.date);
-    const population = (await env.DB.prepare("SELECT r.id,SUM(a.score) AS score FROM runs r JOIN answers a ON a.run_id=r.id WHERE r.date=? AND r.mode='daily' AND r.completed=1 GROUP BY r.id").bind(run.date).all()).results;
+    const puzzle = await puzzleForRun(env, run);
+    const population = run.game_id ? [] : (await env.DB.prepare("SELECT r.id,SUM(a.score) AS score FROM runs r JOIN answers a ON a.run_id=r.id WHERE r.date=? AND r.mode='daily' AND r.completed=1 GROUP BY r.id").bind(run.date).all()).results;
     const own = await state(env, run);
     const others = population.filter(p => p.id !== run.id);
     const dist = Array.from({ length: 71 }, () => 0);
@@ -86,12 +117,32 @@ async function api(request, env, url) {
   }
   if (request.method !== 'POST') return fail('Unknown endpoint.', 404);
   if (request.headers.get('Origin') && request.headers.get('Origin') !== url.origin) return fail('Cross-origin requests are not accepted.', 403);
-  if (Number(request.headers.get('Content-Length') || 0) > 8000) return fail('Request is too large.', 413);
+  const maxBody = path === '/api/custom' ? LIMITS.csvBytes + 4000 : 8000;
+  if (Number(request.headers.get('Content-Length') || 0) > maxBody) return fail('Request is too large.', 413);
   if (!await limit(env, request, player)) return fail('Too many requests. Take a breath and try again.', 429);
-  let data; try { const raw = await request.text(); if (raw.length > 8000) return fail('Request is too large.', 413); data = JSON.parse(raw); } catch { return fail('Invalid request.'); }
+  let data; try { const raw = await request.text(); if (raw.length > maxBody) return fail('Request is too large.', 413); data = JSON.parse(raw); } catch { return fail('Invalid request.'); }
   if (!data || typeof data !== 'object' || Array.isArray(data)) return fail('Invalid request.');
+  if (path === '/api/custom') {
+    const id = player || crypto.randomUUID();
+    const built = buildCustomGame(data.csv, data.title);
+    if (!built.game) return json({ error: built.errors[0], errors: built.errors.slice(0, 50), warnings: built.warnings.slice(0, 50) }, 422);
+    const today = Date.now() - 86400000;
+    const recent = await env.DB.prepare('SELECT COUNT(*) AS n FROM custom_games WHERE creator=? AND created_at>?').bind(id, today).first();
+    if (recent.n >= 25) return fail('You have created a lot of dives today. Try again tomorrow.', 429);
+    const bytes = crypto.getRandomValues(new Uint8Array(10)), alphabet = 'abcdefghijkmnpqrstuvwxyz23456789';
+    const gameId = [...bytes].map(b => alphabet[b % alphabet.length]).join('').padEnd(10, 'a');
+    await env.DB.prepare('INSERT INTO custom_games(id,title,content,creator,created_at) VALUES(?,?,?,?,?)').bind(gameId, built.game.title, JSON.stringify({ prompts: built.game.prompts }), id, Date.now()).run();
+    return json({ id: gameId, title: built.game.title, rounds: built.game.prompts.length, warnings: built.warnings.slice(0, 50), path: `/?custom=${gameId}` }, 201, { 'Set-Cookie': playerCookie(id, url) });
+  }
   if (path === '/api/start') {
-    const id = player || crypto.randomUUID(), mode = data.practice === true ? 'practice' : 'daily';
+    const id = player || crypto.randomUUID(), mode = data.practice === true || data.custom ? 'practice' : 'daily';
+    if (data.custom !== undefined) {
+      const game = await customGame(env, data.custom);
+      if (!game) return fail('That custom dive does not exist.', 404);
+      const rid = crypto.randomUUID();
+      await env.DB.prepare('INSERT INTO runs(id,player,date,mode,round_start,created_at,game_id) VALUES(?,?,?,?,?,?,?)').bind(rid, id, date, 'practice', Date.now() + PREVIEW_MS, Date.now(), game.id).run();
+      return json(await state(env, await ownRun(env, rid, id)), 200, { 'Set-Cookie': playerCookie(id, url) });
+    }
     const puzzle = await puzzleFor(env, date); await saveSample(env, puzzle);
     let run = mode === 'daily' ? await env.DB.prepare("SELECT * FROM runs WHERE player=? AND date=? AND mode='daily'").bind(id, date).first() : null;
     if (!run) {
@@ -99,7 +150,7 @@ async function api(request, env, url) {
       await env.DB.prepare('INSERT OR IGNORE INTO runs(id,player,date,mode,round_start,created_at) VALUES(?,?,?,?,?,?)').bind(rid, id, date, mode, Date.now() + PREVIEW_MS, Date.now()).run();
       run = mode === 'daily' ? await env.DB.prepare("SELECT * FROM runs WHERE player=? AND date=? AND mode='daily'").bind(id,date).first() : await ownRun(env,rid,id);
     }
-    return json(await state(env, run), 200, { 'Set-Cookie': `ok_player=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000${url.protocol === 'https:' ? '; Secure' : ''}` });
+    return json(await state(env, run), 200, { 'Set-Cookie': playerCookie(id, url) });
   }
   if (path === '/api/pause') {
     const run = await ownRun(env,data.runId,player);
@@ -124,7 +175,7 @@ async function api(request, env, url) {
     if (run.paused_at) return fail('Close the menu to resume your dive.',409);
     if (run.completed || run.round_start === null || data.round !== run.next_round) return json({ state: await state(env, run), alreadyScored: true });
     if (Date.now() < run.round_start && env.LOCAL_DEVELOPMENT !== 'true') return fail('The answer window has not opened yet.',409);
-    const puzzle = await puzzleFor(env,run.date), prompt = puzzle.prompts[run.next_round];
+    const puzzle = await puzzleForRun(env,run), prompt = puzzle.prompts[run.next_round];
     const raw = typeof data.answer === 'string' ? data.answer.trim().slice(0,256) : '';
     const late = Date.now() > run.round_start + ROUND_MS;
     // A small network grace period applies only to the client's timed submission.
@@ -168,6 +219,7 @@ export default {
       const docs = documents();
       if (docs[url.pathname]) return headers(new Response(request.method==='HEAD'?null:docs[url.pathname],{headers:{'Content-Type':'text/plain; charset=utf-8','Cache-Control':'no-cache'}}));
       if (url.pathname === '/') return headers(new Response(request.method==='HEAD'?null:homePage(url.searchParams.get('lang') === 'zh' ? 'zh':'en',env),{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-cache'}}));
+      if (url.pathname === '/create') return headers(new Response(request.method==='HEAD'?null:createPage(),{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'public, max-age=300'}}));
       if (['/privacy','/about'].includes(url.pathname)) return headers(new Response(request.method==='HEAD'?null:infoPage(url.pathname),{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'public, max-age=300'}}));
       if (url.pathname === '/robots.txt') return headers(new Response('User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: https://openkrillion.com/sitemap.xml\n',{headers:{'Content-Type':'text/plain; charset=utf-8'}}));
       if (url.pathname === '/sitemap.xml') return headers(new Response('<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'+['/','/about','/privacy'].map(p=>`<url><loc>${SITE.origin}${p}</loc></url>`).join('')+'</urlset>',{headers:{'Content-Type':'application/xml; charset=utf-8'}}));
@@ -181,6 +233,9 @@ export default {
         const h=new Headers({'Cache-Control':'public, max-age=86400'});object.writeHttpMetadata(h);h.set('ETag',object.httpEtag);
         return headers(new Response(request.method==='HEAD'?null:object.body,{headers:h}));
       }
+      // Static files are served by the platform (Vercel) or the local dev server before
+      // requests reach this handler; a Cloudflare-style ASSETS binding is still honoured.
+      if (!env.ASSETS) return headers(fail('Not found.',404));
       const asset = await env.ASSETS.fetch(request);
       return headers(asset, asset.ok ? { 'Cache-Control': url.pathname.endsWith('.woff2') ? 'public, max-age=31536000, immutable' : 'public, max-age=300' } : {});
     } catch (e) { console.error('Request failed:',e.message); return headers(fail('The signal is temporarily lost. Please retry.',503)); }

@@ -7,6 +7,7 @@ No generative AI model is available or called by this game. The models.md filena
 ## Available workflows
 - Daily seven-prompt trivia
 - Practice dives
+- Custom dives imported from CSV
 - Six rarity tiers
 - Typo correction with confirmation
 - Animated ocean descent
@@ -19,7 +20,9 @@ No generative AI model is available or called by this game. The models.md filena
 
 Gameplay language: English. Help and AI questions: English and Chinese.
 
-Answers are validated server-side against prepared entries, with normalization, known aliases and conservative typo correction. Reference answer snapshots may differ from the original game in aliases or subsequent edits. Daily reference synchronization uses public endpoints, caches the snapshot in D1, and falls back to a clearly identified sample practice bank when unavailable.
+Answers are validated server-side against prepared entries, with normalization, known aliases and conservative typo correction. Reference answer snapshots may differ from the original game in aliases or subsequent edits. Daily reference synchronization uses public endpoints, caches the snapshot in its SQLite database, and falls back to a clearly identified sample practice bank when unavailable.
+
+Custom seven-prompt dives can be imported from a CSV file at https://openkrillion.com/create and shared by link; they never affect daily statistics.
 
 No accounts, multiplayer, themed packs, checkout or cross-device account sync is implemented. Practice does not change the daily score or streak.
 
