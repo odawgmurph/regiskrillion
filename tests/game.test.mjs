@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+import { sqliteDatabase, migrate } from '../src/db.mjs';
+import { buildCustomGame, parseCsv, TEMPLATE_CSV } from '../public/custom.mjs';
 import worker, { validateReference } from '../src/worker.mjs';
 import { DEMO } from '../src/demo.mjs';
 import { SITE } from '../src/config.mjs';
@@ -10,23 +11,11 @@ import { etDate, resetAt, normalize, matchAnswer, TIERS } from '../public/rules.
 import { homePage } from '../src/html.mjs';
 
 function database(){
-  const db=new DatabaseSync(':memory:');
-  db.exec(readFileSync(new URL('../migrations/0001_initial.sql',import.meta.url),'utf8'));
-  db.exec(readFileSync(new URL('../migrations/0002_pause.sql',import.meta.url),'utf8'));
-  const prepare=sql=>({
-    bind(...args){
-      const s=db.prepare(sql);
-      return {
-        async first(){return s.get(...args)||null},
-        async all(){return {results:s.all(...args)}},
-        async run(){const r=s.run(...args);return {success:true,meta:{changes:Number(r.changes)}}},
-      };
-    },
-    async first(){return db.prepare(sql).get()||null},
-  });
-  return{prepare,async batch(statements){db.exec('BEGIN');try{const r=[];for(const s of statements)r.push(await s.run());db.exec('COMMIT');return r}catch(e){db.exec('ROLLBACK');throw e}},close:()=>db.close()};
+  const db=sqliteDatabase(':memory:',DatabaseSync);
+  db.ready=migrate(db);
+  return db;
 }
-function service(){const env={DB:database(),BUCKET:{put:async()=>{},get:async()=>null},LOCAL_DEVELOPMENT:'true',REFERENCE_SYNC:'false',ASSETS:{fetch:async()=>new Response('not found',{status:404})}};let cookie='';return{env,async call(path,data,extra={}){const r=await worker.fetch(new Request('http://localhost:3051'+path,{...(data===undefined?{}:{method:'POST',body:JSON.stringify(data),headers:{'Content-Type':'application/json','Cookie':cookie,...extra}}),...(data===undefined?{headers:{Cookie:cookie,...extra}}:{})}),env,{});if(r.headers.get('Set-Cookie'))cookie=r.headers.get('Set-Cookie').split(';')[0];return{status:r.status,body:await r.json()}},cookie:()=>cookie};}
+function service(){const env={DB:database(),BUCKET:{put:async()=>{},get:async()=>null},LOCAL_DEVELOPMENT:'true',REFERENCE_SYNC:'false',};let cookie='';return{env,async call(path,data,extra={}){await env.DB.ready;const r=await worker.fetch(new Request('http://localhost:3051'+path,{...(data===undefined?{}:{method:'POST',body:JSON.stringify(data),headers:{'Content-Type':'application/json','Cookie':cookie,...extra}}),...(data===undefined?{headers:{Cookie:cookie,...extra}}:{})}),env,{});if(r.headers.get('Set-Cookie'))cookie=r.headers.get('Set-Cookie').split(';')[0];return{status:r.status,body:await r.json()}},cookie:()=>cookie};}
 
 test('New York reset follows DST rather than device midnight',()=>{
   assert.equal(etDate(Date.parse('2026-10-17T03:59:59Z')),'2026-10-16');
@@ -95,5 +84,53 @@ test('SSR SEO exposes an expandable guide, correct canonical and no crawler-spec
   assert.ok(words.length>1500);assert.ok(density>.03);assert.ok(!html.includes('googlebot'));
 });
 test('public docs GET and HEAD are readable UTF-8 and not SPA HTML',async()=>{
-  const s=service();for(const path of Object.keys(documents()))for(const method of ['GET','HEAD']){const r=await worker.fetch(new Request('http://localhost:3051'+path,{method}),s.env,{});assert.equal(r.status,200);assert.match(r.headers.get('Content-Type'),/text\/plain; charset=utf-8/);const body=await r.text();if(method==='HEAD')assert.equal(body,'');else{assert.ok(body.startsWith('# OpenKrillion'));assert.ok(!body.includes('<!doctype html>'));}}s.env.DB.close();
+  const s=service();for(const path of Object.keys(documents()))for(const method of ['GET','HEAD']){await s.env.DB.ready;const r=await worker.fetch(new Request('http://localhost:3051'+path,{method}),s.env,{});assert.equal(r.status,200);assert.match(r.headers.get('Content-Type'),/text\/plain; charset=utf-8/);const body=await r.text();if(method==='HEAD')assert.equal(body,'');else{assert.ok(body.startsWith('# OpenKrillion'));assert.ok(!body.includes('<!doctype html>'));}}s.env.DB.close();
+});
+
+test('migrations apply once and are idempotent',async()=>{
+  const db=sqliteDatabase(':memory:',DatabaseSync);
+  assert.deepEqual(await migrate(db),['0001_initial','0002_pause','0003_custom_games']);
+  assert.deepEqual(await migrate(db),[]);
+  db.close();
+});
+test('CSV parser handles quotes, embedded commas/newlines, CRLF, BOM and semicolons',()=>{
+  const {rows}=parseCsv('\uFEFFquestion,answer\r\n"Say ""hi"", please","multi\nline"\r\n\r\nx,y');
+  assert.deepEqual(rows,[['question','answer'],['Say "hi", please','multi\nline'],['x','y']]);
+  assert.deepEqual(parseCsv('a;b;c\n1;2;3').rows[1],['1','2','3']);
+  assert.throws(()=>parseCsv('a,"open'));
+});
+test('CSV import groups seven prompts, parses tiers/aliases and reports line-numbered errors',()=>{
+  const ok=buildCustomGame(TEMPLATE_CSV,'  My   dive ');
+  assert.deepEqual(ok.errors,[]);assert.equal(ok.game.title,'My dive');assert.equal(ok.game.prompts.length,7);
+  const go=ok.game.prompts[6].answers.find(a=>a.answer==='Go');assert.equal(go.tier,'rare');assert.deepEqual(go.aliases,['weiqi','baduk']);
+  assert.equal(ok.game.prompts[0].answers.at(-1).quip,'Also called the eggfruit, it tastes like custard.');
+  const numeric=buildCustomGame(TEMPLATE_CSV.replace('Banana,plankton','Banana,10').replace('Lemon,plankton','Lemon,One in a Krillion'));
+  assert.equal(numeric.game.prompts[0].answers[0].tier,'plankton');assert.equal(numeric.game.prompts[0].answers[1].tier,'krillion');
+  const bad=buildCustomGame('question,answer,tier\nQ1,A,legendary\nQ1,,rare\n');
+  assert.ok(bad.errors.some(e=>e.startsWith('Line 2: tier')));assert.ok(bad.errors.some(e=>e.startsWith('Line 3: answer is empty')));assert.ok(bad.errors.some(e=>e.includes('exactly 7')));
+  assert.match(buildCustomGame('foo,bar\n1,2').errors[0],/Missing: question, answer, tier/);
+  const dup=buildCustomGame(TEMPLATE_CSV+'Name a board game,chess,rare,,\n');assert.ok(dup.warnings.some(w=>w.includes('duplicate')));
+});
+test('custom dives are created from CSV on the server, playable by link, server-scored and excluded from daily stats',async()=>{
+  const s=service();
+  const bad=await s.call('/api/custom',{title:'Bad',csv:'question,answer,tier\nQ,A,plankton'});assert.equal(bad.status,422);assert.ok(bad.body.errors.length);
+  const created=await s.call('/api/custom',{title:'Trivia night',csv:TEMPLATE_CSV});assert.equal(created.status,201);assert.match(created.body.id,/^[a-z0-9]{10}$/);assert.equal(created.body.path,'/?custom='+created.body.id);
+  const info=await s.call('/api/custom?id='+created.body.id);assert.equal(info.body.title,'Trivia night');assert.equal(info.body.prompts.length,7);assert.ok(!JSON.stringify(info.body).includes('Canistel'));
+  assert.equal((await s.call('/api/custom?id=nope')).status,404);
+  const player=service();
+  let{body:game}=await player.call('/api/start',{custom:created.body.id});
+  assert.equal(game.mode,'custom');assert.equal(game.customId,created.body.id);assert.equal(game.title,'Trivia night');assert.equal(game.prompts[0].text,'Name a fruit that is yellow');
+  const parsed=buildCustomGame(TEMPLATE_CSV).game;
+  for(let i=0;i<7;i++){
+    const best=[...parsed.prompts[i].answers].sort((a,b)=>TIERS[b.tier].score-TIERS[a.tier].score)[0];
+    const r=await player.call('/api/answer',{runId:game.runId,round:i,answer:best.answer,confirm:true});assert.equal(r.body.result.tier,best.tier);game=r.body.state;
+    if(i<6)await player.call('/api/next',{runId:game.runId});
+  }
+  assert.equal(game.completed,true);assert.equal(game.score,parsed.prompts.reduce((n,p)=>n+Math.max(...p.answers.map(a=>TIERS[a.tier].score)),0));
+  const review=await player.call('/api/review?run='+game.runId);assert.equal(review.status,200);assert.equal(review.body.population,0);assert.ok(review.body.prompts[0].answers.some(a=>a.answer==='Canistel'));
+  const daily=await player.call('/api/start',{});assert.equal(daily.body.mode,'daily');assert.notEqual(daily.body.runId,game.runId);assert.equal(daily.body.results.length,0);
+  assert.equal((await player.call('/api/start',{custom:'zzzzzzzzzz'})).status,404);
+  assert.equal((await s.call('/api/custom',{csv:TEMPLATE_CSV},{Origin:'https://evil.example'})).status,403);
+  const page=await worker.fetch(new Request('http://localhost:3051/create'),s.env,{});assert.equal(page.status,200);assert.ok((await page.text()).includes('id="create-form"'));
+  s.env.DB.close();player.env.DB.close();
 });

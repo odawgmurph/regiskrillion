@@ -5,11 +5,13 @@ import { siClaude, siPerplexity, siGooglegemini } from 'simple-icons';
 import { documents } from '../src/docs.mjs';
 import { SITE } from '../src/config.mjs';
 import { homePage } from '../src/html.mjs';
+import { TEMPLATE_CSV } from '../public/custom.mjs';
 
 await mkdir('public/assets',{recursive:true});
 const sprite=shrimp();
 for(const[name,svg]of Object.entries({'krill':sprite,'krill-gold':shrimp('gold'),'evil':shrimp('evil'),'schooler':fish(),'tooclever':fish(true),'rare':squid(),'deepcut':angler()}))await writeFile('public/assets/'+name+'.svg',svg);
 await copyFile('node_modules/@fontsource/vt323/files/vt323-latin-400-normal.woff2','public/assets/vt323-latin-400-normal.woff2');
+await writeFile('public/assets/custom-dive-template.csv',TEMPLATE_CSV);
 await copyFile('node_modules/@fontsource/vt323/LICENSE','public/assets/VT323-LICENSE.txt');
 for(const[name,icon]of [['claude',siClaude],['perplexity',siPerplexity],['gemini',siGooglegemini]])await writeFile(`public/assets/${name}.svg`,`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img"><title>${icon.title}</title><path fill="currentColor" d="${icon.path}"/></svg>`);
 for(const name of ['chatgpt','grok']){const text=await readFile(`public/assets/${name}.svg`,'utf8');if(!text.includes('<svg')||/<script|\bonload\s*=|\bonerror\s*=/.test(text))throw new Error('Invalid local icon: '+name);}
