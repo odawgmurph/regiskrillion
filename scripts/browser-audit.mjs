@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 const base=process.argv[2]||'http://localhost:3051';
 const output=process.argv[3]||'output/playwright/audit';
 await mkdir(output,{recursive:true});
-const browser=await chromium.launch({headless:true,channel:'chrome'});
+const browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_PATH?{executablePath:process.env.CHROMIUM_PATH}:{channel:'chrome'})});
 const errors=[],report=[];
 try{
   const context=await browser.newContext({viewport:{width:1440,height:1000},permissions:['clipboard-read','clipboard-write']});

@@ -1,3 +1,7 @@
+// Ordered schema migrations. Kept in a JavaScript module (rather than .sql files)
+// so serverless bundlers always ship them with the function.
+export const MIGRATIONS = [
+  { id: '0001_initial', sql: `
 CREATE TABLE IF NOT EXISTS puzzles (
   date TEXT PRIMARY KEY,
   day_number INTEGER NOT NULL,
@@ -40,4 +44,20 @@ CREATE TABLE IF NOT EXISTS feedback (
   kind TEXT NOT NULL,
   text TEXT NOT NULL,
   created_at INTEGER NOT NULL
+);` },
+  { id: '0002_pause', sql: 'ALTER TABLE runs ADD COLUMN paused_at INTEGER;' },
+  // Custom games imported from CSV. Their runs reuse mode='practice' (so they never
+  // enter daily population statistics) and are tagged with game_id.
+  { id: '0003_custom_games', sql: `
+CREATE TABLE IF NOT EXISTS custom_games (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  creator TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS custom_creator ON custom_games(creator,created_at);
+ALTER TABLE runs ADD COLUMN game_id TEXT;` },
+];
+
+export const statements = sql => sql.split(/;\s*(?:\n|$)/).map(s => s.trim()).filter(Boolean);

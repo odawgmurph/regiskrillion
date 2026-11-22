@@ -8,7 +8,7 @@ if(target===root)throw new Error('Choose the separate public checkout.');
 const remote=execFileSync('git',['remote','get-url','origin'],{cwd:target,encoding:'utf8'}).trim();
 if(!/github\.com[:/]VulcanEon\/openkrillion\.com-service(?:\.git)?$/.test(remote))throw new Error('Public destination repository mismatch.');
 const files=execFileSync('git',['ls-files','--cached','--others','--exclude-standard','-z'],{cwd:root,encoding:'utf8'}).split('\0').filter(Boolean);
-const denied=/(^|\/)(?:\.git|node_modules|\.wrangler|private|output)(?:\/|$)|wrangler\.production|(?:^|\/)\.env|(?:^|\/)\.dev\.vars(?!\.example$)/;
+const denied=/(^|\/)(?:\.git|node_modules|\.wrangler|\.vercel|\.data|private|output)(?:\/|$)|wrangler\.production|(?:^|\/)\.env|(?:^|\/)\.dev\.vars(?!\.example$)/;
 for(const file of [...new Set(files)]){
   if(denied.test(file)||file.includes('..'))throw new Error('Unsafe public file: '+file);
   await mkdir(path.dirname(path.join(target,file)),{recursive:true});

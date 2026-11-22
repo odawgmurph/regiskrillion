@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 const base=process.argv[2]||'http://localhost:3051',output=process.argv[3]||'output/audio';await mkdir(output,{recursive:true});
-const browser=await chromium.launch({headless:true,channel:'chrome'});
+const browser=await chromium.launch({headless:true,...(process.env.CHROMIUM_PATH?{executablePath:process.env.CHROMIUM_PATH}:{channel:'chrome'})});
 try{
   const page=await browser.newPage();await page.goto(base);await page.waitForFunction(()=>window.render_game_to_text);
   const results=await page.evaluate(async()=>{
